@@ -20,6 +20,7 @@ try:
     from ase.constraints import FixAtoms
     from pfp_api_client.pfp.estimator import Estimator, EstimatorCalcMode
     from pfp_api_client.pfp.calculators.ase_calculator import ASECalculator
+    from fairchem.core import pretrained_mlip, FAIRChemCalculator
     import numpy as np
     import optuna
 except ImportError as e:
@@ -303,7 +304,7 @@ def find_carbons_near_functional_groups(atoms, functional_groups, max_distance=3
     return nearby_carbons
 
 
-def run_carbon_optimization(structure_file, temperature=300, md_steps=100000, opt_trials=100):
+def run_carbon_optimization(structure_file, temperature=300, md_steps=100000, opt_trials=100, calculator_type="ase"):
     """运行C原子优化"""
     print(f"🔧 Running carbon optimization for: {structure_file}")
     
@@ -325,9 +326,29 @@ def run_carbon_optimization(structure_file, temperature=300, md_steps=100000, op
             print("   📝 Using structure as-is")
         
         # 设置计算器
-        estimator = Estimator(model_version="v8.0.0", calc_mode=EstimatorCalcMode.CRYSTAL_U0_PLUS_D3)
-        calculator = ASECalculator(estimator)
+        
+        #estimator = Estimator(model_version="v8.0.0", calc_mode=EstimatorCalcMode.CRYSTAL_U0_PLUS_D3)
+        #calculator = ASECalculator(estimator)        
+    
+        #predictor = pretrained_mlip.get_predict_unit("uma-s-1p1", device="cuda")
+        #calculator = FAIRChemCalculator(predictor, task_name="oc20")
+
+        print(f"   🔧 Setting up calculator: {calculator_type}")
+        
+        if calculator_type.lower() == "fairchem":
+            # 使用 FAIRChem 计算器
+            predictor = pretrained_mlip.get_predict_unit("uma-s-1p1", device="cuda")
+            calculator = FAIRChemCalculator(predictor, task_name="oc20")
+            print("   ✅ Using FAIRChem calculator")
+        else:
+            # 使用 ASE 计算器 (默认)
+            estimator = Estimator(model_version="v8.0.0", calc_mode=EstimatorCalcMode.CRYSTAL_U0_PLUS_D3)
+            calculator = ASECalculator(estimator)
+            print("   ✅ Using ASE calculator")
+        
         atoms.calc = calculator
+        
+
         
         # 初始结构优化
         print("\n🔧 Initial structure optimization...")
@@ -438,6 +459,8 @@ def main():
                        help="Number of optimization trials per carbon (default: 100)")
     parser.add_argument("--output_dir", type=str, default="carbon_optimization_results",
                        help="Output directory name (default: carbon_optimization_results)")
+    parser.add_argument("--calculator", type=str, default="ase", choices=["ase", "fairchem"],
+                       help="Calculator type: ase or fairchem (default: ase)")
     
     args = parser.parse_args()
     
@@ -449,13 +472,15 @@ def main():
     print("=" * 50)
     print(f"📖 Structure file: {args.structure_file}")
     print(f"🔄 Optimization trials: {args.opt_trials}")
+    print(f"🔧 Calculator: {args.calculator}")
     print(f"📁 Output directory: {args.output_dir}")
     print()
     
     # 运行C原子优化
     result = run_carbon_optimization(
         args.structure_file,
-        opt_trials=args.opt_trials
+        opt_trials=args.opt_trials,
+        calculator_type=args.calculator
     )
     
     if result:
