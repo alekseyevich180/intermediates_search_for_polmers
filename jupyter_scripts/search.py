@@ -36,9 +36,378 @@ from ase.neb import NEB
 from ase.optimize import BFGS
 from ase.constraints import FixAtoms
 from ase.geometry import get_distances
+from ase.constraints import FixAtoms
+from ase.optimize import BFGSLineSearch
+# from scipy.spatial.distance import pdist, squareform  # 暂时注释掉
+# from sklearn.cluster import DBSCAN  # 暂时注释掉，避免导入错误
 
 from pfcc_extras.visualize.view import view_ngl
 from pfcc_extras.visualize.ase import view_ase_atoms
+
+
+class FunctionalGroupAnalyzer:
+    """分析分子中的官能团和周围的C原子"""
+    
+    def __init__(self, atoms, calculator):
+        self.atoms = atoms
+        self.calculator = calculator
+        self.functional_groups = []
+        self.carbon_atoms = []
+        self.bond_network = {}
+        
+    def identify_functional_groups(self):
+        """识别分子中的官能团"""
+        symbols = self.atoms.get_chemical_symbols()
+        positions = self.atoms.get_positions()
+        
+        # 定义官能团模式
+        functional_patterns = {
+            'ketone': ['C', 'O'],  # 酮基
+            'alcohol': ['O', 'H'],  # 羟基
+            'carboxylic_acid': ['C', 'O', 'O'],  # 羧基
+            'aldehyde': ['C', 'O'],  # 醛基
+            'ester': ['C', 'O', 'C'],  # 酯基
+            'amine': ['N', 'H'],  # 氨基
+            'amide': ['C', 'O', 'N'],  # 酰胺基
+        }
+        
+        # 查找官能团
+        for group_name, pattern in functional_patterns.items():
+            group_atoms = self._find_pattern(pattern, symbols, positions)
+            if group_atoms:
+                self.functional_groups.append({
+                    'name': group_name,
+                    'atoms': group_atoms,
+                    'center': self._calculate_group_center(group_atoms, positions)
+                })
+        
+        return self.functional_groups
+    
+    def _find_pattern(self, pattern, symbols, positions):
+        """查找特定的原子模式"""
+        # 简化的模式匹配，实际应用中可能需要更复杂的算法
+        pattern_atoms = []
+        
+        if pattern == ['C', 'O']:  # 酮基或醛基
+            for i, symbol in enumerate(symbols):
+                if symbol == 'C':
+                    for j, other_symbol in enumerate(symbols):
+                        if other_symbol == 'O' and i != j:
+                            distance = np.linalg.norm(positions[i] - positions[j])
+                            if distance < 1.5:  # C=O键长
+                                pattern_atoms = [i, j]
+                                break
+                    if pattern_atoms:
+                        break
+        
+        return pattern_atoms
+    
+    def _calculate_group_center(self, atom_indices, positions):
+        """计算官能团的几何中心"""
+        if not atom_indices:
+            return None
+        return np.mean([positions[i] for i in atom_indices], axis=0)
+    
+    def find_carbons_near_functional_groups(self, max_distance=3.0):
+        """找到官能团周围的C原子"""
+        if not self.functional_groups:
+            self.identify_functional_groups()
+        
+        symbols = self.atoms.get_chemical_symbols()
+        positions = self.atoms.get_positions()
+        
+        nearby_carbons = []
+        
+        for group in self.functional_groups:
+            group_center = group['center']
+            if group_center is None:
+                continue
+            
+            for i, symbol in enumerate(symbols):
+                if symbol == 'C' and i not in group['atoms']:  # 排除官能团中的C
+                    distance = np.linalg.norm(positions[i] - group_center)
+                    if distance <= max_distance:
+                        nearby_carbons.append({
+                            'index': i,
+                            'distance_to_group': distance,
+                            'functional_group': group['name'],
+                            'position': positions[i].copy()
+                        })
+        
+        # 按距离排序
+        nearby_carbons.sort(key=lambda x: x['distance_to_group'])
+        self.carbon_atoms = nearby_carbons
+        
+        return nearby_carbons
+    
+    def build_bond_network(self):
+        """构建键网络，用于约束优化"""
+        positions = self.atoms.get_positions()
+        symbols = self.atoms.get_chemical_symbols()
+        
+        bond_network = {}
+        
+        for i in range(len(self.atoms)):
+            bond_network[i] = []
+            for j in range(i+1, len(self.atoms)):
+                distance = np.linalg.norm(positions[i] - positions[j])
+                # 判断是否为键（简化判断）
+                if self._is_bond(i, j, distance, symbols):
+                    bond_network[i].append(j)
+                    bond_network[j].append(i)
+        
+        self.bond_network = bond_network
+        return bond_network
+    
+    def _is_bond(self, i, j, distance, symbols):
+        """判断两个原子是否成键"""
+        # 简化的键判断逻辑
+        bond_lengths = {
+            ('C', 'C'): 1.6,
+            ('C', 'O'): 1.5,
+            ('C', 'N'): 1.5,
+            ('C', 'H'): 1.2,
+            ('O', 'H'): 1.0,
+            ('N', 'H'): 1.1,
+        }
+        
+        pair = tuple(sorted([symbols[i], symbols[j]]))
+        max_bond_length = bond_lengths.get(pair, 2.0)
+        
+        return distance < max_bond_length
+
+
+class MDStabilitySearcher:
+    """通过MD模拟寻找最稳定的结构"""
+    
+    def __init__(self, atoms, calculator, temperature=300, steps=100000, sample_interval=100):
+        self.atoms = atoms
+        self.calculator = calculator
+        self.temperature = temperature
+        self.steps = steps
+        self.sample_interval = sample_interval
+        self.sampled_structures = []
+        self.energies = []
+        
+    def run_md_sampling(self):
+        """运行MD模拟并采样结构"""
+        print(f"🧪 Running MD sampling: {self.steps} steps at {self.temperature}K")
+        
+        # 设置计算器
+        self.atoms.calc = self.calculator
+        
+        # 设置初始速度
+        MaxwellBoltzmannDistribution(self.atoms, temperature_K=self.temperature, force_temp=True)
+        Stationary(self.atoms)
+        
+        # 创建MD动力学
+        dyn = NPT(
+            self.atoms,
+            0.5 * units.fs,
+            temperature_K=self.temperature,
+            externalstress=0,
+            ttime=100 * units.fs,
+            pfactor=None,
+            trajectory="md_sampling.xyz",
+            loginterval=self.sample_interval,
+        )
+        
+        # 采样回调函数
+        def sample_structure():
+            step = dyn.get_number_of_steps()
+            if step % self.sample_interval == 0:
+                energy = self.atoms.get_potential_energy()
+                structure = self.atoms.copy()
+                
+                self.sampled_structures.append({
+                    'step': step,
+                    'atoms': structure,
+                    'energy': energy,
+                    'positions': structure.get_positions().copy()
+                })
+                self.energies.append(energy)
+                
+                if step % (self.sample_interval * 10) == 0:
+                    print(f"   Sampled at step {step}, energy: {energy:.4f} eV")
+        
+        # 附加采样
+        dyn.attach(sample_structure, interval=self.sample_interval)
+        
+        # 运行MD
+        dyn.run(self.steps)
+        
+        print(f"   Sampling complete: {len(self.sampled_structures)} structures sampled")
+        return self.sampled_structures
+    
+    def find_most_stable_structure(self):
+        """找到最稳定的结构"""
+        if not self.sampled_structures:
+            self.run_md_sampling()
+        
+        # 找到能量最低的结构
+        min_energy_idx = np.argmin(self.energies)
+        most_stable = self.sampled_structures[min_energy_idx]
+        
+        print(f"🎯 Most stable structure found at step {most_stable['step']}")
+        print(f"   Energy: {most_stable['energy']:.4f} eV")
+        
+        return most_stable
+
+
+class ProgressiveCarbonOptimizer:
+    """从近到远逐步优化C原子的位置"""
+    
+    def __init__(self, atoms, calculator, carbon_atoms, functional_groups):
+        self.atoms = atoms
+        self.calculator = calculator
+        self.carbon_atoms = carbon_atoms
+        self.functional_groups = functional_groups
+        self.optimization_history = []
+        
+    def optimize_carbons_progressively(self, n_trials=100):
+        """逐步优化C原子位置"""
+        print(f"🔧 Starting progressive carbon optimization...")
+        print(f"   {len(self.carbon_atoms)} carbon atoms to optimize")
+        
+        # 创建Optuna研究
+        study = optuna.create_study(direction='minimize')
+        
+        # 设置用户属性
+        study.set_user_attr("atoms", atoms_to_json(self.atoms))
+        study.set_user_attr("calculator", "ASECalculator")
+        study.set_user_attr("carbon_atoms", self.carbon_atoms)
+        
+        # 逐步优化每个C原子
+        for i, carbon_info in enumerate(self.carbon_atoms):
+            print(f"\n🎯 Optimizing carbon atom {i+1}/{len(self.carbon_atoms)}")
+            print(f"   Distance to functional group: {carbon_info['distance_to_group']:.2f} Å")
+            
+            # 为当前C原子创建优化目标函数
+            def objective(trial):
+                return self._optimize_single_carbon(trial, carbon_info, i)
+            
+            # 运行优化
+            study.optimize(objective, n_trials=n_trials)
+            
+            # 保存最佳结果
+            best_params = study.best_params
+            best_energy = study.best_value
+            
+            print(f"   Best energy: {best_energy:.4f} eV")
+            print(f"   Best parameters: {best_params}")
+            
+            # 更新原子结构
+            self._apply_optimization_result(best_params, carbon_info)
+            
+            # 记录历史
+            self.optimization_history.append({
+                'carbon_index': i,
+                'carbon_info': carbon_info,
+                'best_energy': best_energy,
+                'best_params': best_params
+            })
+        
+        return self.optimization_history
+    
+    def _optimize_single_carbon(self, trial, carbon_info, carbon_index):
+        """优化单个C原子的位置"""
+        # 创建原子副本
+        atoms_copy = self.atoms.copy()
+        atoms_copy.calc = self.calculator
+        
+        # 固定其他原子（除了当前优化的C原子）
+        carbon_idx = carbon_info['index']
+        constraints = []
+        
+        for i in range(len(atoms_copy)):
+            if i != carbon_idx:
+                constraints.append(FixAtoms(indices=[i]))
+        
+        atoms_copy.set_constraint(constraints)
+        
+        # 获取当前C原子的位置
+        current_pos = atoms_copy.get_positions()[carbon_idx]
+        
+        # 定义优化参数（位置和旋转）
+        # 位置偏移
+        dx = trial.suggest_float(f"dx_{carbon_index}", -1.0, 1.0)
+        dy = trial.suggest_float(f"dy_{carbon_index}", -1.0, 1.0)
+        dz = trial.suggest_float(f"dz_{carbon_index}", -0.5, 0.5)
+        
+        # 旋转角度
+        phi = trial.suggest_float(f"phi_{carbon_index}", 0, 2*np.pi)
+        theta = trial.suggest_float(f"theta_{carbon_index}", 0, np.pi)
+        psi = trial.suggest_float(f"psi_{carbon_index}", 0, 2*np.pi)
+        
+        # 应用位置偏移
+        new_pos = current_pos + np.array([dx, dy, dz])
+        atoms_copy.positions[carbon_idx] = new_pos
+        
+        # 检查键约束
+        if not self._check_bond_constraints(atoms_copy, carbon_idx):
+            return float('inf')  # 违反键约束，返回无穷大能量
+        
+        # 优化结构
+        try:
+            opt = LBFGS(atoms_copy)
+            opt.run(fmax=0.01)
+            
+            energy = atoms_copy.get_potential_energy()
+            
+            # 再次检查键约束
+            if not self._check_bond_constraints(atoms_copy, carbon_idx):
+                return float('inf')
+            
+            return energy
+            
+        except Exception as e:
+            print(f"   Optimization failed: {e}")
+            return float('inf')
+    
+    def _check_bond_constraints(self, atoms, carbon_idx):
+        """检查键约束是否满足"""
+        positions = atoms.get_positions()
+        symbols = atoms.get_chemical_symbols()
+        
+        # 检查当前C原子与相邻原子的键长
+        for i in range(len(atoms)):
+            if i != carbon_idx:
+                distance = np.linalg.norm(positions[carbon_idx] - positions[i])
+                symbols_pair = tuple(sorted([symbols[carbon_idx], symbols[i]]))
+                
+                # 定义键长范围
+                bond_ranges = {
+                    ('C', 'C'): (1.2, 1.8),
+                    ('C', 'O'): (1.1, 1.7),
+                    ('C', 'N'): (1.1, 1.7),
+                    ('C', 'H'): (0.9, 1.3),
+                }
+                
+                if symbols_pair in bond_ranges:
+                    min_bond, max_bond = bond_ranges[symbols_pair]
+                    if distance < min_bond or distance > max_bond:
+                        return False  # 键长超出合理范围
+        
+        return True
+    
+    def _apply_optimization_result(self, params, carbon_info):
+        """应用优化结果到原子结构"""
+        carbon_idx = carbon_info['index']
+        current_pos = self.atoms.get_positions()[carbon_idx]
+        
+        # 提取参数
+        dx = params.get(f"dx_{self.carbon_atoms.index(carbon_info)}", 0)
+        dy = params.get(f"dy_{self.carbon_atoms.index(carbon_info)}", 0)
+        dz = params.get(f"dz_{self.carbon_atoms.index(carbon_info)}", 0)
+        
+        # 应用位置变化
+        new_pos = current_pos + np.array([dx, dy, dz])
+        self.atoms.positions[carbon_idx] = new_pos
+        
+        # 重新优化整个结构
+        self.atoms.calc = self.calculator
+        opt = LBFGS(self.atoms)
+        opt.run(fmax=0.01)
 
 
 class ReactionDetector:
@@ -464,14 +833,14 @@ def main():
         # from torch_dftd.torch_dftd3_calculator import TorchDFTD3Calculator
         # d3 = TorchDFTD3Calculator(atoms=atoms, device="cpu")
         # calc = SumCalculator([calc, d3])
-    atoms.calc = calc
+    atoms.calc = calculator
 
     # set momenta
     MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, force_temp=True)
     Stationary(atoms)
 
     # 创建反应监控器
-    detector, tracker = create_reaction_monitor(atoms, calc, "reaction_analysis")
+    detector, tracker = create_reaction_monitor(atoms, calculator, "reaction_analysis")
     print("🔬 Reaction monitoring initialized")
 
     if args.ensemble == "nvt":
@@ -1024,13 +1393,255 @@ def run_oxidation_analysis_example():
         print(f"❌ Error during analysis: {e}")
 
 
+def extract_molecule_from_surface(structure_file):
+    """从包含表面的结构中提取分子部分"""
+    print(f"🔍 Extracting molecule from surface structure: {structure_file}")
+    
+    try:
+        import numpy as np
+        from ase import Atoms
+        
+        # 读取完整结构
+        full_atoms = read(structure_file)
+        print(f"   Total atoms: {len(full_atoms)}")
+        
+        # 分析原子类型
+        symbols = full_atoms.get_chemical_symbols()
+        unique_symbols = list(set(symbols))
+        print(f"   Element types: {unique_symbols}")
+        
+        # 统计各元素数量
+        element_counts = {}
+        for symbol in unique_symbols:
+            element_counts[symbol] = symbols.count(symbol)
+        print(f"   Element counts: {element_counts}")
+        
+        # 识别表面和分子层
+        positions = full_atoms.get_positions()
+        z_coords = positions[:, 2]
+        z_min, z_max = z_coords.min(), z_coords.max()
+        z_range = z_max - z_min
+        
+        print(f"   Z coordinate range: {z_min:.2f} to {z_max:.2f} Å")
+        
+        # 识别表面层 (底部30%)
+        surface_threshold = z_min + z_range * 0.3
+        surface_indices = np.where(z_coords < surface_threshold)[0]
+        
+        # 识别分子层 (40%以上)
+        molecule_threshold = z_min + z_range * 0.4
+        molecule_indices = np.where(z_coords > molecule_threshold)[0]
+        
+        print(f"   Surface atoms: {len(surface_indices)}")
+        print(f"   Molecule atoms: {len(molecule_indices)}")
+        
+        # 检查分子部分是否包含有机元素
+        if len(molecule_indices) > 0:
+            molecule_symbols = [symbols[i] for i in molecule_indices]
+            organic_elements = ['C', 'H', 'O', 'N', 'S', 'P']
+            has_organic = any(elem in molecule_symbols for elem in organic_elements)
+            
+            if has_organic:
+                print("   ✅ Organic molecule detected")
+                
+                # 提取分子部分
+                molecule_positions = positions[molecule_indices]
+                molecule_atoms = Atoms(symbols=molecule_symbols, positions=molecule_positions)
+                
+                # 保存分子部分
+                molecule_file = structure_file.replace('.cif', '_molecule_only.cif')
+                write(molecule_file, molecule_atoms)
+                print(f"   💾 Molecule saved as: {molecule_file}")
+                
+                return molecule_file, molecule_atoms
+            else:
+                print("   ⚠️  No organic molecule detected")
+                return structure_file, full_atoms  # 返回原始结构
+        else:
+            print("   ⚠️  No molecule layer detected, using full structure")
+            return structure_file, full_atoms
+            
+    except Exception as e:
+        print(f"   ❌ Error extracting molecule: {e}")
+        return structure_file, read(structure_file)
+
+
+def run_carbon_optimization_analysis(structure_file, temperature=300, md_steps=100000, opt_trials=100):
+    """
+    运行C原子优化分析的主函数
+    
+    Args:
+        structure_file: 反应中间体结构文件路径 (可以是表面+分子或纯分子)
+        temperature: MD模拟温度 (K)
+        md_steps: MD模拟步数
+        opt_trials: Optuna优化试验次数
+    """
+    print("🔬 Starting Carbon Optimization Analysis")
+    print("=" * 50)
+    
+    try:
+        # 1. 读取和分析结构文件
+        print(f"📖 Reading structure file: {structure_file}")
+        atoms = read(structure_file)
+        print(f"   Structure loaded: {len(atoms)} atoms")
+        
+        # 检查是否包含表面 (通过元素类型和位置判断)
+        symbols = atoms.get_chemical_symbols()
+        positions = atoms.get_positions()
+        
+        # 检查是否包含金属元素 (可能的表面)
+        metal_elements = ['Pt', 'Pd', 'Au', 'Ag', 'Cu', 'Ni', 'Fe', 'Ti', 'Al', 'Zn', 'Ir', 'Ru']
+        has_metal = any(metal in symbols for metal in metal_elements)
+        
+        if has_metal and len(atoms) > 50:  # 大结构且包含金属
+            print("   🔍 Metal surface detected, extracting molecule...")
+            target_file, atoms = extract_molecule_from_surface(structure_file)
+            print(f"   Using extracted molecule: {len(atoms)} atoms")
+        else:
+            print("   📝 Using structure as-is (molecule-only)")
+            target_file = structure_file
+        
+        # 2. 设置计算器
+        print("⚙️  Setting up calculator...")
+        estimator = Estimator(model_version="v8.0.0", calc_mode=EstimatorCalcMode.CRYSTAL_U0_PLUS_D3)
+        calculator = ASECalculator(estimator)
+        atoms.calc = calculator
+        
+        # 3. 初始结构优化
+        print("🔧 Initial structure optimization...")
+        opt = LBFGS(atoms)
+        opt.run(fmax=0.01)
+        initial_energy = atoms.get_potential_energy()
+        print(f"   Initial energy: {initial_energy:.4f} eV")
+        
+        # 4. 识别官能团和周围的C原子
+        print("\n🔍 Identifying functional groups and nearby carbons...")
+        analyzer = FunctionalGroupAnalyzer(atoms, calculator)
+        functional_groups = analyzer.identify_functional_groups()
+        print(f"   Found {len(functional_groups)} functional groups:")
+        for group in functional_groups:
+            print(f"     - {group['name']}: atoms {group['atoms']}")
+        
+        carbon_atoms = analyzer.find_carbons_near_functional_groups(max_distance=3.0)
+        print(f"   Found {len(carbon_atoms)} carbon atoms near functional groups:")
+        for i, carbon in enumerate(carbon_atoms[:5]):  # 只显示前5个
+            print(f"     - Carbon {carbon['index']}: distance {carbon['distance_to_group']:.2f} Å to {carbon['functional_group']}")
+        
+        if len(carbon_atoms) == 0:
+            print("⚠️  No carbon atoms found near functional groups!")
+            return None
+        
+        # 5. MD模拟寻找最稳定结构
+        print(f"\n🧪 Running MD simulation to find stable structure...")
+        md_searcher = MDStabilitySearcher(
+            atoms, 
+            calculator, 
+            temperature=temperature, 
+            steps=md_steps, 
+            sample_interval=100
+        )
+        
+        most_stable = md_searcher.find_most_stable_structure()
+        print(f"   Most stable structure energy: {most_stable['energy']:.4f} eV")
+        
+        # 使用最稳定的结构进行后续优化
+        atoms = most_stable['atoms'].copy()
+        
+        # 6. 从近到远逐步优化C原子
+        print(f"\n🎯 Starting progressive carbon optimization...")
+        optimizer = ProgressiveCarbonOptimizer(
+            atoms, 
+            calculator, 
+            carbon_atoms, 
+            functional_groups
+        )
+        
+        optimization_history = optimizer.optimize_carbons_progressively(n_trials=opt_trials)
+        
+        # 7. 保存结果
+        print(f"\n💾 Saving results...")
+        output_dir = "carbon_optimization_results"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 保存最终优化结构
+        final_energy = atoms.get_potential_energy()
+        write(f"{output_dir}/final_optimized_structure.cif", atoms)
+        
+        # 保存优化历史
+        optimization_summary = {
+            'initial_energy': initial_energy,
+            'md_stable_energy': most_stable['energy'],
+            'final_energy': final_energy,
+            'energy_improvement': initial_energy - final_energy,
+            'functional_groups': functional_groups,
+            'carbon_atoms': carbon_atoms,
+            'optimization_history': optimization_history
+        }
+        
+        with open(f"{output_dir}/optimization_summary.json", 'w') as f:
+            json.dump(optimization_summary, f, indent=2, default=str)
+        
+        # 8. 生成分析报告
+        print(f"\n📊 Analysis Summary:")
+        print(f"   Initial energy: {initial_energy:.4f} eV")
+        print(f"   MD stable energy: {most_stable['energy']:.4f} eV")
+        print(f"   Final optimized energy: {final_energy:.4f} eV")
+        print(f"   Total energy improvement: {initial_energy - final_energy:.4f} eV")
+        print(f"   Carbon atoms optimized: {len(carbon_atoms)}")
+        print(f"   Optimization trials per carbon: {opt_trials}")
+        
+        print(f"\n✅ Analysis complete!")
+        print(f"   Results saved in: {output_dir}/")
+        print(f"   Final structure: {output_dir}/final_optimized_structure.cif")
+        
+        return {
+            'atoms': atoms,
+            'optimization_history': optimization_history,
+            'summary': optimization_summary
+        }
+        
+    except FileNotFoundError:
+        print(f"❌ Structure file not found: {structure_file}")
+        return None
+    except Exception as e:
+        print(f"❌ Error during analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 if __name__ == "__main__":
-    # 可以选择运行主MD程序或氧化反应分析
+    # 可以选择运行不同的分析模式
     import sys
     
-    if len(sys.argv) > 1 and sys.argv[1] == "--oxidation":
-        # 运行氧化反应分析
-        run_oxidation_analysis_example()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--oxidation":
+            # 运行氧化反应分析
+            run_oxidation_analysis_example()
+        elif sys.argv[1] == "--carbon-optimization":
+            # 运行C原子优化分析
+            if len(sys.argv) > 2:
+                structure_file = sys.argv[2]
+                # 可选参数
+                temperature = int(sys.argv[3]) if len(sys.argv) > 3 else 300
+                md_steps = int(sys.argv[4]) if len(sys.argv) > 4 else 100000
+                opt_trials = int(sys.argv[5]) if len(sys.argv) > 5 else 100
+                
+                run_carbon_optimization_analysis(
+                    structure_file=structure_file,
+                    temperature=temperature,
+                    md_steps=md_steps,
+                    opt_trials=opt_trials
+                )
+            else:
+                print("❌ Please provide structure file path")
+                print("Usage: python search.py --carbon-optimization <structure_file> [temperature] [md_steps] [opt_trials]")
+                print("Example: python search.py --carbon-optimization 2-nonanone.cif 400 100000 100")
+        else:
+            print("❌ Unknown option. Available options:")
+            print("  --oxidation: Run oxidation reaction analysis")
+            print("  --carbon-optimization <file>: Run carbon optimization analysis")
+            print("  (no option): Run standard MD simulation")
     else:
         # 运行标准MD程序
         main()
