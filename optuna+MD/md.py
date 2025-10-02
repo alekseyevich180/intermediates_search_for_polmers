@@ -8,7 +8,7 @@ import numpy as np
 from ase import Atoms, units
 from ase.calculators.calculator import PropertyNotImplementedError
 from ase.eos import EquationOfState
-from ase.io import read
+from ase.io import read, write
 from ase.md import MDLogger
 from ase.md.npt import NPT
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution, Stationary
@@ -20,6 +20,21 @@ from pfp_api_client.pfp.estimator import Estimator, EstimatorCalcMode
 from pfp_api_client.pfp.calculators.ase_calculator import ASECalculator
 
 print(f"pfp_api_client: {pfp_api_client.__version__}")
+
+import io
+import pandas as pd
+from ase.constraints import ExpCellFilter, StrainFilter
+from ase.io.jsonio import write_json, read_json
+from ase.optimize import LBFGS, FIRE
+from IPython.display import Image
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import optuna
+from ase.visualize import view
+
+from pfcc_extras.visualize.view import view_ngl
+from pfcc_extras.visualize.ase import view_ase_atoms
+
 
 
 class MDLogger(IOContext):
@@ -302,7 +317,7 @@ def already_mol(filename):
     return mol, E_mol
 
 
-def get_all_molecules():
+def get_all_intermediates():
     molecules = []
     for fname in [ "4-ketone.cif", "5-ketone.cif",]:
         mol, E_mol = already_mol(fname)
@@ -320,6 +335,14 @@ def atoms_to_json(atoms):
 
 def json_to_atoms(atoms_str):
     return read(io.StringIO(atoms_str), format="json")
+
+for mol, E_mol, name in get_all_intermediates():
+    print(f"🔍 Molecule: {name}")
+    mol_json_str = atoms_to_json(mol)
+    mol2 = json_to_atoms(mol_json_str)
+    
+    print(f"{mol_json_str=}")
+    view_ngl(mol2, representations=["ball+stick"]) 
 
 
 
@@ -353,3 +376,82 @@ def objective(trial):
     trial.set_user_attr("structure", atoms_to_json(combined))
 
     return E_slab_mol - E_slab - E_mol
+
+
+
+for mol, E_mol, name in get_all_intermediates():
+    print(f"\n🔍 Starting optimization for {name}...\n")
+    slab, E_slab = already_slab()
+    view(mol, viewer="ngl")
+
+    study = optuna.create_study()
+    study.set_user_attr("slab", atoms_to_json(slab))
+    study.set_user_attr("E_slab", E_slab)
+    study.set_user_attr("mol", atoms_to_json(mol))
+    study.set_user_attr("E_mol", E_mol)
+
+    study.optimize(objective, n_trials=300)
+
+    print(f"    Best trial for {name} is #{study.best_trial.number}")
+    print(f"    Adsorption energy: {study.best_value:.6f} eV")
+    print("    Adsorption position:")
+    for key in ["phi", "theta", "psi", "x_pos", "y_pos", "z_hig"]:
+        print(f"        {key}: {study.best_params[key]}")
+
+    output_dir = os.path.join("output", name)
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save optimization plots
+    optuna.visualization.plot_optimization_history(study).write_html(
+        os.path.join(output_dir, "optimization_history.html"))
+    optuna.visualization.plot_slice(study).write_html(
+        os.path.join(output_dir, "optimization_slice.html"))
+
+    # Save best trial structure
+    best_slab = json_to_atoms(study.best_trial.user_attrs["structure"])
+    view_ngl(best_slab, representations=["ball+stick"])
+    write(os.path.join(output_dir, "best_trial.cif"), best_slab)
+
+    # Save all trials' structures and images
+    trial_data = []
+    n_trials = len(study.trials)
+    fig_rows = (n_trials // 10) + 1
+    fig, axes = plt.subplots(fig_rows, 10, figsize=(20, 2 * fig_rows))
+
+    if fig_rows == 1:
+        axes = [axes]  # flatten if only one row
+
+    for trial in study.trials:
+        slab = json_to_atoms(trial.user_attrs["structure"])
+
+        # Save structure file
+        trial_cif = os.path.join(output_dir, f"{trial.number}.cif")
+        write(trial_cif, slab)
+
+        # Save image
+        img_path = os.path.join(output_dir, f"{trial.number}.png")
+        write(img_path, slab, rotation="0x,0y,90z")
+        ax = axes[trial.number // 10][trial.number % 10]
+        ax.imshow(mpimg.imread(img_path))
+        ax.set_axis_off()
+        ax.set_title(trial.number)
+
+        # Collect trial data
+        trial_data.append({
+            "trial": trial.number,
+            "energy": trial.value,
+            **trial.params
+        })
+
+    # Save energy data CSV
+    df = pd.DataFrame(trial_data)
+    df.to_csv(os.path.join(output_dir, "data.csv"), index=False)
+
+    # Save grid plot of all trials
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "trial_grid.png"))
+    plt.show()
+
+    # Show all trial structures in viewer
+    slabs = [json_to_atoms(trial.user_attrs["structure"]) for trial in study.trials]
+    view_ngl(slabs, representations=["ball+stick"], replace_structure=True)
